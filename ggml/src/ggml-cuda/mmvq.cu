@@ -458,9 +458,11 @@ static __global__ void mul_mat_vec_q(
     uint32_t channel_y;
     uint32_t sample_dst;
 
-    channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
-    channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
-    sample_dst = blockIdx.z;
+    const uint32_t token_idx = blockIdx.z;
+
+    channel_x  = ncols_dst == 1 && ids ? ids[channel_dst + token_idx*ids_stride] : fastdiv(channel_dst, channel_ratio);
+    channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y)    : channel_dst;
+    sample_dst = ncols_dst == 1 && ids ? 0                                      : blockIdx.z;
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
@@ -879,8 +881,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return use;
     };
 
-    if (has_ids) {
-        // MUL_MAT_ID path - dedicated MoE kernel
+    if (has_ids && !has_fusion) {
+        // MUL_MAT_ID path - dedicated MoE kernel. Routed fusion needs the generic
+        // MMVQ kernel above because it applies bias and GLU gate in-kernel.
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
