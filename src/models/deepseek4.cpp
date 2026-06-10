@@ -154,9 +154,10 @@ public:
             // n_kv_total[mi] is the actual (unpadded) size; slots in
             // [n_kv_total, n_kv_padded) are padding and stay at -INFINITY.
             const int64_t n_kv_actual = (mi < kq_mask_n_kv_total.size()) ? kq_mask_n_kv_total[mi] : n_kv_padded;
+            const int64_t q_off = (mi < kq_mask_q_offset.size()) ? kq_mask_q_offset[mi] : 0;
             f32_data.assign(ggml_nelements(mask), -INFINITY);
             for (int64_t iq = 0; iq < n_q; ++iq) {
-                const int32_t q_pos = ubatch->pos ? ubatch->pos[std::min<int64_t>(iq, n_tokens - 1)] : 0;
+                const int32_t q_pos = ubatch->pos ? ubatch->pos[std::min<int64_t>(q_off + iq, n_tokens - 1)] : 0;
                 for (int64_t ikv = 0; ikv < n_kv_actual; ++ikv) {
                     if (ikv >= (int64_t) n_swa || ikv <= q_pos) {
                         f32_data[iq*n_kv_padded + ikv] = 0.0f;
@@ -190,7 +191,8 @@ public:
     // Cache shared kq_mask tensors keyed by (n_kv_total, work_tokens) so all
     // V4 layers with the same comp_ratio reuse a single graph input. Without
     // this we hit GGML_SCHED_MAX_SPLIT_INPUTS (30) at >30 layers.
-    std::map<std::pair<int64_t,int64_t>, ggml_tensor *> kq_mask_by_shape;
+    std::map<std::tuple<int64_t,int64_t,int64_t>, ggml_tensor *> kq_mask_by_shape;
+    std::vector<int64_t>       kq_mask_q_offset;
 
     std::vector<int32_t> i32_data;
     std::vector<float> f32_data;
@@ -279,7 +281,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         return ggml_view_2d(ctx0, tensor, rows, cols, tensor->nb[1], row_offset * tensor->nb[0] + col_offset * tensor->nb[1]);
     };
 
-    auto compression_ape_rows = [&](ggml_tensor * ape, int64_t comp_dim, int64_t comp_ratio) -> ggml_tensor * {
+    auto compression_ape_rows = [&](ggml_tensor * ape, int64_t comp_dim, int64_t comp_ratio, llama_pos start_pos, int64_t work_tokens) -> ggml_tensor * {
         const int64_t start_mod = start_pos % comp_ratio;
 
         // Fast path: the entire ubatch fits within one compression window.
@@ -508,7 +510,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         return weighted_sum_hc(x_hc, pre);
     };
 
-    auto build_grouped_out = [&](ggml_tensor * attn_out, const llama_layer & layer, int il) -> ggml_tensor * {
+    auto build_grouped_out = [&](ggml_tensor * attn_out, const llama_layer & layer, int il, int64_t work_tokens) -> ggml_tensor * {
         const int64_t group_dim = layer.attn_out_a->ne[0];
         const int64_t n_groups = total_q_dim / group_dim;
         const int64_t o_rank = layer.attn_out_b->ne[0] / n_groups;
@@ -785,6 +787,16 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         return build_expert_mix(cur_ffn, selected_experts, weights, layer, il);
     };
 
+    struct ds4_attn_idx {
+        ggml_tensor * attn_cache_idx; ggml_tensor * comp_pos_r4; ggml_tensor * comp_pos_r128;
+        ggml_tensor * comp_cache_idx_r4; ggml_tensor * comp_cache_idx_r128; ggml_tensor * indexer_cache_idx_r4;
+        ggml_tensor * comp_slot_idx_r4; ggml_tensor * comp_slot_idx_r128;
+    };
+    struct ds4_attn_state {
+        ggml_tensor * attn_kv; ggml_tensor * attn_comp_kv_state; ggml_tensor * attn_comp_score_state;
+        ggml_tensor * indexer_kv; ggml_tensor * indexer_comp_kv_state; ggml_tensor * indexer_comp_score_state;
+    };
+
     auto build_attn_v4 = [&](ggml_tensor * cur_attn, const llama_layer & layer, int il) -> ggml_tensor * {
         const int64_t comp_ratio = layer.attn_compress_ape ? layer.attn_compress_ape->ne[1] : 0;
         const float layer_freq_base = layer.attn_compress_ape ? hparams.rope_freq_base_train_swa : hparams.rope_freq_base_train;
@@ -824,16 +836,18 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         ggml_tensor * k_flat = cont_if_needed(reshape_2d_checked(k_states, head_dim, work_tokens, "build_attn_v4.k_flat", il));
 
         const auto & state = mctx_cur->get_layer(il);
-        ggml_tensor * updated_cache = ggml_set_rows(ctx0, state.attn_kv, k_flat, deepseek4_inputs->attn_cache_idx);
-        ggml_tensor * updated_attn_comp_kv_state = state.attn_comp_kv_state;
-        ggml_tensor * updated_attn_comp_score_state = state.attn_comp_score_state;
-        ggml_tensor * updated_indexer_kv = state.indexer_kv;
-        ggml_tensor * updated_indexer_comp_kv_state = state.indexer_comp_kv_state;
-        ggml_tensor * updated_indexer_comp_score_state = state.indexer_comp_score_state;
+        ds4_attn_state st { state.attn_kv, state.attn_comp_kv_state, state.attn_comp_score_state, state.indexer_kv, state.indexer_comp_kv_state, state.indexer_comp_score_state };
+        auto attn_window = [&](int64_t work_tokens, llama_pos start_pos, ggml_tensor * inp_pos, ggml_tensor * q_states, ggml_tensor * k_flat, ggml_tensor * q_base, ggml_tensor * cur_attn, const ds4_attn_idx & idx, int64_t q_offset, ds4_attn_state & st) -> ggml_tensor * {
+        ggml_tensor * updated_cache = ggml_set_rows(ctx0, st.attn_kv, k_flat, idx.attn_cache_idx);
+        ggml_tensor * updated_attn_comp_kv_state = st.attn_comp_kv_state;
+        ggml_tensor * updated_attn_comp_score_state = st.attn_comp_score_state;
+        ggml_tensor * updated_indexer_kv = st.indexer_kv;
+        ggml_tensor * updated_indexer_comp_kv_state = st.indexer_comp_kv_state;
+        ggml_tensor * updated_indexer_comp_score_state = st.indexer_comp_score_state;
 
         if (comp_ratio > 0) {
-            GGML_ASSERT(state.attn_comp_kv_state != nullptr);
-            GGML_ASSERT(state.attn_comp_score_state != nullptr);
+            GGML_ASSERT(st.attn_comp_kv_state != nullptr);
+            GGML_ASSERT(st.attn_comp_score_state != nullptr);
 
             const int64_t comp_dim = layer.attn_compress_ape->ne[0];
             const int64_t comp_slots = comp_dim / head_dim;
@@ -850,33 +864,33 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             // add CPY nodes to the prefill graph (43 layers x 2 nodes
             // per ubatch). Drop them.
 
-            ggml_tensor * ape_row = compression_ape_rows(layer.attn_compress_ape, comp_dim, comp_ratio);
+            ggml_tensor * ape_row = compression_ape_rows(layer.attn_compress_ape, comp_dim, comp_ratio, start_pos, work_tokens);
             comp_score = ggml_add(ctx0, comp_score, ape_row);
             cb(comp_score, "attn_comp_score", il);
 
             ggml_tensor * comp_slot_idx = nullptr;
             if (comp_ratio == 4) {
-                comp_slot_idx = deepseek4_inputs->comp_slot_idx_r4;
+                comp_slot_idx = idx.comp_slot_idx_r4;
             } else if (comp_ratio == 128) {
-                comp_slot_idx = deepseek4_inputs->comp_slot_idx_r128;
+                comp_slot_idx = idx.comp_slot_idx_r128;
             } else {
                 GGML_ABORT("deepseek4: unsupported compress ratio %" PRId64, comp_ratio);
             }
 
             if (!multiwindow_r4) {
-                updated_attn_comp_kv_state = ggml_set_rows(ctx0, state.attn_comp_kv_state, comp_kv, comp_slot_idx);
-                updated_attn_comp_score_state = ggml_set_rows(ctx0, state.attn_comp_score_state, comp_score, comp_slot_idx);
+                updated_attn_comp_kv_state = ggml_set_rows(ctx0, st.attn_comp_kv_state, comp_kv, comp_slot_idx);
+                updated_attn_comp_score_state = ggml_set_rows(ctx0, st.attn_comp_score_state, comp_score, comp_slot_idx);
             }
 
             if (should_compress) {
                 ggml_tensor * comp_pos = nullptr;
                 ggml_tensor * comp_cache_idx = nullptr;
                 if (comp_ratio == 4) {
-                    comp_pos = deepseek4_inputs->comp_pos_r4;
-                    comp_cache_idx = deepseek4_inputs->comp_cache_idx_r4;
+                    comp_pos = idx.comp_pos_r4;
+                    comp_cache_idx = idx.comp_cache_idx_r4;
                 } else if (comp_ratio == 128) {
-                    comp_pos = deepseek4_inputs->comp_pos_r128;
-                    comp_cache_idx = deepseek4_inputs->comp_cache_idx_r128;
+                    comp_pos = idx.comp_pos_r128;
+                    comp_cache_idx = idx.comp_cache_idx_r128;
                 } else {
                     GGML_ABORT("deepseek4: unsupported compress ratio %" PRId64, comp_ratio);
                 }
@@ -899,9 +913,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     const size_t  col_stride = comp_dim * type_size;
 
                     // prev slab: iw=0 from state, iw>=1 from comp_kv first half
-                    ggml_tensor * state_first_kv = ggml_view_3d(ctx0, state.attn_comp_kv_state,
+                    ggml_tensor * state_first_kv = ggml_view_3d(ctx0, st.attn_comp_kv_state,
                             head_dim, r, 1, col_stride, r * col_stride, 0);
-                    ggml_tensor * state_first_score = ggml_view_3d(ctx0, state.attn_comp_score_state,
+                    ggml_tensor * state_first_score = ggml_view_3d(ctx0, st.attn_comp_score_state,
                             head_dim, r, 1, col_stride, r * col_stride, 0);
                     ggml_tensor * comp_kv_prev_strided = (n > 1) ? ggml_view_3d(ctx0, comp_kv,
                             head_dim, r, n - 1, col_stride, r * col_stride, 0) : nullptr;
@@ -1021,8 +1035,6 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 }
             }
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, updated_attn_comp_kv_state, state.attn_comp_kv_state));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, updated_attn_comp_score_state, state.attn_comp_score_state));
         }
 
         const bool indexer_reaches_topk =
@@ -1038,9 +1050,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             layer.indexer_compress_norm != nullptr &&
             layer.indexer_compress_kv != nullptr &&
             layer.indexer_compress_gate != nullptr &&
-            state.indexer_kv != nullptr &&
-            state.indexer_comp_kv_state != nullptr &&
-            state.indexer_comp_score_state != nullptr &&
+            st.indexer_kv != nullptr &&
+            st.indexer_comp_kv_state != nullptr &&
+            st.indexer_comp_score_state != nullptr &&
             deepseek4_inputs->indexer_hadamard != nullptr;
 
         if (has_indexer) {
@@ -1059,18 +1071,18 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
             ggml_tensor * indexer_comp_kv = mul_mat_checked(layer.indexer_compress_kv, cur_attn, "build_attn_v4.indexer_comp_kv");
             ggml_tensor * indexer_comp_score = mul_mat_checked(layer.indexer_compress_gate, cur_attn, "build_attn_v4.indexer_comp_score");
 
-            ggml_tensor * indexer_ape_row = compression_ape_rows(layer.indexer_compress_ape, indexer_comp_dim, comp_ratio);
+            ggml_tensor * indexer_ape_row = compression_ape_rows(layer.indexer_compress_ape, indexer_comp_dim, comp_ratio, start_pos, work_tokens);
             indexer_comp_score = ggml_add(ctx0, indexer_comp_score, indexer_ape_row);
             cb(indexer_comp_score, "indexer_comp_score", il);
 
             if (!multiwindow_r4) {
-                updated_indexer_comp_kv_state = ggml_set_rows(ctx0, state.indexer_comp_kv_state, indexer_comp_kv, deepseek4_inputs->comp_slot_idx_r4);
-                updated_indexer_comp_score_state = ggml_set_rows(ctx0, state.indexer_comp_score_state, indexer_comp_score, deepseek4_inputs->comp_slot_idx_r4);
+                updated_indexer_comp_kv_state = ggml_set_rows(ctx0, st.indexer_comp_kv_state, indexer_comp_kv, idx.comp_slot_idx_r4);
+                updated_indexer_comp_score_state = ggml_set_rows(ctx0, st.indexer_comp_score_state, indexer_comp_score, idx.comp_slot_idx_r4);
             }
 
             if (should_compress) {
-                ggml_tensor * indexer_comp_pos = deepseek4_inputs->comp_pos_r4;
-                ggml_tensor * indexer_cache_idx = deepseek4_inputs->indexer_cache_idx_r4;
+                ggml_tensor * indexer_comp_pos = idx.comp_pos_r4;
+                ggml_tensor * indexer_cache_idx = idx.indexer_cache_idx_r4;
 
                 if (multiwindow_r4) {
                     // See attn-side compression for the strided-view explanation.
@@ -1079,9 +1091,9 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                     const size_t  type_size = ggml_type_size(GGML_TYPE_F32);
                     const size_t  col_stride = indexer_comp_dim * type_size;
 
-                    ggml_tensor * state_first_kv = ggml_view_3d(ctx0, state.indexer_comp_kv_state,
+                    ggml_tensor * state_first_kv = ggml_view_3d(ctx0, st.indexer_comp_kv_state,
                             indexer_head_dim, r, 1, col_stride, r * col_stride, 0);
-                    ggml_tensor * state_first_score = ggml_view_3d(ctx0, state.indexer_comp_score_state,
+                    ggml_tensor * state_first_score = ggml_view_3d(ctx0, st.indexer_comp_score_state,
                             indexer_head_dim, r, 1, col_stride, r * col_stride, 0);
                     ggml_tensor * comp_kv_prev_strided = (n > 1) ? ggml_view_3d(ctx0, indexer_comp_kv,
                             indexer_head_dim, r, n - 1, col_stride, r * col_stride, 0) : nullptr;
@@ -1189,14 +1201,8 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 }
             }
 
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, updated_indexer_comp_kv_state, state.indexer_comp_kv_state));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, updated_indexer_comp_score_state, state.indexer_comp_score_state));
-            if (should_compress) {
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, updated_indexer_kv, state.indexer_kv));
-            }
         }
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, updated_cache, state.attn_kv));
 
         const int64_t n_kv = std::min<int64_t>(start_pos + work_tokens, hparams.n_swa);
         ggml_tensor * kv_prefix = ggml_view_2d(ctx0, updated_cache, head_dim, n_kv, updated_cache->nb[1], 0);
@@ -1381,7 +1387,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
         ggml_tensor * kq_mask = nullptr;
         {
-            const auto key = std::make_pair(n_kv_total_padded, (int64_t) work_tokens);
+            const auto key = std::make_tuple(n_kv_total_padded, (int64_t) work_tokens, q_offset);
             auto it = deepseek4_inputs->kq_mask_by_shape.find(key);
             if (it != deepseek4_inputs->kq_mask_by_shape.end()) {
                 kq_mask = it->second;
@@ -1391,6 +1397,7 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 ggml_format_name(kq_mask, "deepseek4_kq_mask_%lldx%lld", (long long) n_kv_total_padded, (long long) work_tokens);
                 deepseek4_inputs->kq_masks.push_back(kq_mask);
                 deepseek4_inputs->kq_mask_n_kv_total.push_back(n_kv_total);
+                deepseek4_inputs->kq_mask_q_offset.push_back(q_offset);
                 deepseek4_inputs->kq_mask_by_shape[key] = kq_mask;
             }
         }
@@ -1424,7 +1431,56 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
         out = cont_if_needed(reshape_2d_checked(out, total_q_dim, work_tokens, "build_attn_v4.out_2d", il));
         cb(out, "attn_out", il);
 
-        return build_grouped_out(out, layer, il);
+        st.attn_kv = updated_cache;
+        st.attn_comp_kv_state = updated_attn_comp_kv_state;
+        st.attn_comp_score_state = updated_attn_comp_score_state;
+        st.indexer_kv = updated_indexer_kv;
+        st.indexer_comp_kv_state = updated_indexer_comp_kv_state;
+        st.indexer_comp_score_state = updated_indexer_comp_score_state;
+        return build_grouped_out(out, layer, il, work_tokens);
+        };
+
+        // V4 sliding-window (n_swa=128) attention + the r128/r4 KV-compression
+        // assume a micro-batch never crosses a 128-token window boundary (the
+        // SWA ring is exactly n_swa slots; the r128 compressor has no
+        // multi-window path). At -ub>128 a single ubatch spans several windows
+        // and silently corrupts. Split such a ubatch into per-128-window
+        // sub-batches that reproduce the (correct) -ub<=128 graph exactly,
+        // threading the KV/compression state across windows and writing it
+        // back to the persistent cache only once at the end.
+        const int64_t n_swa_i = (int64_t) hparams.n_swa;
+        ggml_tensor * out_full = nullptr;
+        if (((int64_t) start_pos % n_swa_i) + work_tokens <= n_swa_i) {
+            const ds4_attn_idx idx { deepseek4_inputs->attn_cache_idx, deepseek4_inputs->comp_pos_r4, deepseek4_inputs->comp_pos_r128, deepseek4_inputs->comp_cache_idx_r4, deepseek4_inputs->comp_cache_idx_r128, deepseek4_inputs->indexer_cache_idx_r4, deepseek4_inputs->comp_slot_idx_r4, deepseek4_inputs->comp_slot_idx_r128 };
+            out_full = attn_window(work_tokens, start_pos, inp_pos, q_states, k_flat, q_base, cur_attn, idx, 0, st);
+        } else {
+            for (int64_t done = 0; done < work_tokens; ) {
+                const int64_t W = (int64_t) start_pos + done;
+                const int64_t wlen = std::min<int64_t>(n_swa_i - (W % n_swa_i), work_tokens - done);
+                auto sv1 = [&](ggml_tensor * x) { return ggml_view_1d(ctx0, x, wlen, (size_t) done * x->nb[0]); };
+                const ds4_attn_idx idx { sv1(deepseek4_inputs->attn_cache_idx), sv1(deepseek4_inputs->comp_pos_r4), sv1(deepseek4_inputs->comp_pos_r128), sv1(deepseek4_inputs->comp_cache_idx_r4), sv1(deepseek4_inputs->comp_cache_idx_r128), sv1(deepseek4_inputs->indexer_cache_idx_r4), sv1(deepseek4_inputs->comp_slot_idx_r4), sv1(deepseek4_inputs->comp_slot_idx_r128) };
+                ggml_tensor * qs_w = ggml_view_3d(ctx0, q_states, q_states->ne[0], q_states->ne[1], wlen, q_states->nb[1], q_states->nb[2], (size_t) done * q_states->nb[2]);
+                ggml_tensor * kf_w = ggml_view_2d(ctx0, k_flat, k_flat->ne[0], wlen, k_flat->nb[1], (size_t) done * k_flat->nb[1]);
+                ggml_tensor * qb_w = ggml_view_2d(ctx0, q_base, q_base->ne[0], wlen, q_base->nb[1], (size_t) done * q_base->nb[1]);
+                ggml_tensor * ca_w = ggml_view_2d(ctx0, cur_attn, cur_attn->ne[0], wlen, cur_attn->nb[1], (size_t) done * cur_attn->nb[1]);
+                ggml_tensor * ip_w = ggml_view_1d(ctx0, inp_pos, wlen, (size_t) done * inp_pos->nb[0]);
+                ggml_tensor * out_w = attn_window(wlen, (llama_pos) W, ip_w, qs_w, kf_w, qb_w, ca_w, idx, done, st);
+                out_full = out_full ? ggml_concat(ctx0, out_full, out_w, 1) : out_w;
+                done += wlen;
+            }
+        }
+
+        // Only write back state tensors that were actually modified. A tensor
+        // left untouched (no compression this ubatch, or a layer/arch without
+        // attn-compression or indexer state, where state.X is nullptr) keeps
+        // its original pointer; cpy'ing it would deref a null/identity tensor.
+        if (st.attn_kv                 != state.attn_kv)                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, st.attn_kv, state.attn_kv));
+        if (st.attn_comp_kv_state      != state.attn_comp_kv_state)      ggml_build_forward_expand(gf, ggml_cpy(ctx0, st.attn_comp_kv_state, state.attn_comp_kv_state));
+        if (st.attn_comp_score_state   != state.attn_comp_score_state)   ggml_build_forward_expand(gf, ggml_cpy(ctx0, st.attn_comp_score_state, state.attn_comp_score_state));
+        if (st.indexer_kv              != state.indexer_kv)              ggml_build_forward_expand(gf, ggml_cpy(ctx0, st.indexer_kv, state.indexer_kv));
+        if (st.indexer_comp_kv_state   != state.indexer_comp_kv_state)   ggml_build_forward_expand(gf, ggml_cpy(ctx0, st.indexer_comp_kv_state, state.indexer_comp_kv_state));
+        if (st.indexer_comp_score_state != state.indexer_comp_score_state) ggml_build_forward_expand(gf, ggml_cpy(ctx0, st.indexer_comp_score_state, state.indexer_comp_score_state));
+        return out_full;
     };
 
     ggml_tensor * hc_target = ggml_new_tensor_3d(ctx0, inpL->type, n_embd, hc_mult, work_tokens);
